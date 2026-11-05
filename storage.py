@@ -1,77 +1,62 @@
 import json
 from pathlib import Path
 
-import pandas as pd
-
-
-DATA_DIR = Path(__file__).parent / "data"
-
+DATA_DIR = Path(__file__).resolve().parent / "data"
 PROFILE_FILE = DATA_DIR / "user_profile.json"
 HOLDINGS_FILE = DATA_DIR / "holdings.json"
 ALLOCATION_FILE = DATA_DIR / "last_allocation.json"
 
-
 DEFAULT_PROFILE = {
     "profile_id": "default_user",
-    "capital": 100000.0,
+    "capital": 10000.0,
     "risk_profile": "Moderate",
     "investment_horizon": "Long-term (above 3 years)",
     "target_return": 12.0,
-    "max_weight": 0.30
+    "max_weight": 0.30,
 }
 
 
-def load_json(file_path, default):
-    """Load JSON data or return its default value."""
+def _load_json(path, default):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not file_path.exists():
+    if not path.exists():
         return default.copy()
-
     try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (json.JSONDecodeError, OSError):
+        with path.open("r", encoding="utf-8") as file:
+            value = json.load(file)
+        return value if isinstance(value, dict) else default.copy()
+    except (OSError, json.JSONDecodeError):
         return default.copy()
 
 
-def save_json(file_path, data):
-    """Save data as formatted JSON."""
+def _save_json(path, value):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(file_path, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(value, file, indent=4)
+    temporary.replace(path)
 
 
 def load_profile():
-    return load_json(PROFILE_FILE, DEFAULT_PROFILE)
+    return {**DEFAULT_PROFILE, **_load_json(PROFILE_FILE, DEFAULT_PROFILE)}
 
 
 def save_profile(profile):
-    save_json(PROFILE_FILE, profile)
+    _save_json(PROFILE_FILE, profile)
 
 
 def load_holdings():
-    holdings = load_json(HOLDINGS_FILE, {"holdings": []})
-    return holdings.get("holdings", [])
+    payload = _load_json(HOLDINGS_FILE, {"holdings": []})
+    holdings = payload.get("holdings", [])
+    return holdings if isinstance(holdings, list) else []
 
 
 def save_holdings(holdings):
-    save_json(HOLDINGS_FILE, {"holdings": holdings})
+    _save_json(HOLDINGS_FILE, {"holdings": holdings})
 
 
 def load_last_allocation():
-    return load_json(ALLOCATION_FILE, {"weights": {}})
+    return _load_json(ALLOCATION_FILE, {"weights": {}})
 
 
 def save_last_allocation(allocation):
-    save_json(ALLOCATION_FILE, allocation)
-
-
-def holdings_to_dataframe(holdings):
-    columns = ["Ticker", "Quantity", "Average Purchase Price"]
-
-    if not holdings:
-        return pd.DataFrame(columns=columns)
-
-    return pd.DataFrame(holdings, columns=columns)
+    _save_json(ALLOCATION_FILE, allocation)
