@@ -1,14 +1,7 @@
-<<<<<<< HEAD
+streamlit
 yfinance
 pandas
 numpy
 scipy
 scikit-learn
 plotly
-streamlit
-=======
-streamlit
-pandas
-numpy
-plotly
->>>>>>> feature/streamlit-dashboard

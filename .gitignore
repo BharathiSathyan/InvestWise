@@ -1,10 +1,7 @@
-<<<<<<< HEAD
-__pycache__
-.venv
-=======
 .venv/
 __pycache__/
 *.pyc
+
 data/user_profile.json
+data/holdings.json
 data/last_allocation.json
->>>>>>> feature/streamlit-dashboard
