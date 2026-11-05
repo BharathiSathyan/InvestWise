@@ -8,7 +8,7 @@ from storage import load_profile, save_profile, load_holdings, save_holdings
 from risklens.config import TICKERS, BENCHMARK, TRADING_DAYS
 from risklens.data import get_aligned_prices, refresh_market_data
 from risklens.metrics import calculate_metrics
-from risklens.optimize import generate_portfolios, RISK_PROFILES
+from risklens.optimize import generate_portfolios, generate_investment_plans, RISK_PROFILES
 from risklens.costs import calculate_transaction_cost, calculate_buy_sell
 from risklens.backtest import run_backtest
 
@@ -455,121 +455,229 @@ with tabs[1]:
 # INVESTMENT PLANNER
 # ============================================================
 with tabs[2]:
-    st.subheader("Optimize Portfolio")
-    st.caption("Compare allocation strategies using the selected historical estimates and your current holdings.")
+    st.subheader("Investment Planner")
+    st.caption("Plan what to do with fresh cash while accounting for the holdings you already own.")
     if prices is None:
         st.warning("Market data is required before optimization.")
     else:
         metrics = calculate_metrics(prices)
         mu = metrics["expected_returns"].reindex(TICKERS)
-        covariance_choice = st.radio("Covariance estimator", ["Sample covariance", "Ledoit–Wolf shrinkage covariance"], horizontal=True)
+        covariance_choice = st.radio(
+            "Risk estimation method",
+            ["Sample covariance", "Ledoit–Wolf shrinkage covariance"],
+            horizontal=True,
+            help="Shrinkage covariance can make risk estimates more stable when historical returns are noisy.",
+        )
         covariance = metrics["sample_covariance"] if covariance_choice == "Sample covariance" else metrics["shrinkage_covariance"]
         covariance = covariance.reindex(index=TICKERS, columns=TICKERS)
 
         gamma = RISK_PROFILES.get(profile.get("risk_profile", "Moderate"), 5)
-        max_weight = float(profile.get("max_weight", 0.30))
-        cost_bps = st.slider("Estimated proportional transaction cost (basis points)", min_value=0, max_value=50, value=10, step=1)
-        cost_rate = cost_bps / 10000
+        saved_cap = float(profile.get("max_weight", 0.30))
+        default_cap = min(max(saved_cap, 0.10), 0.30)
+        max_weight = st.slider(
+            "Maximum allocation to any one stock",
+            min_value=10,
+            max_value=100,
+            value=int(round(default_cap * 100)),
+            step=5,
+            format="%d%%",
+            help="This is a diversification constraint for this planning run. It does not change your saved profile setting.",
+        ) / 100.0
+        cost_bps = st.slider(
+            "Estimated transaction cost (basis points per rupee traded)",
+            min_value=0,
+            max_value=50,
+            value=10,
+            step=1,
+            help="Illustrative proportional cost. Actual brokerage, taxes and exchange charges may differ.",
+        )
+        cost_rate = cost_bps / 10000.0
+        current_w = current_weights.reindex(TICKERS).fillna(0.0).astype(float)
+        current_cash = max(0.0, 1.0 - float(current_w.sum()))
 
-        st.info(f"Risk preference: **{profile.get('risk_profile')}** · Risk-aversion parameter γ = **{gamma}** · Maximum stock weight = **{max_weight:.0%}**")
-        st.warning("The current optimizer requires fully invested equity weights summing to 100%. The recommendation therefore assumes all fresh capital plus existing holdings are deployed across the 10-stock universe; it does not retain a cash reserve.")
+        horizon_years = {
+            "Short-term (up to 1 year)": 1.0,
+            "Medium-term (1–3 years)": 2.0,
+            "Long-term (above 3 years)": 4.0,
+        }.get(profile.get("investment_horizon"), 2.0)
 
-        if st.button("Run Portfolio Optimization", type="primary", width="stretch"):
+        reserve_max_pct = max(0, int(np.floor(current_cash * 100)))
+        reserve_default_pct = min(5, reserve_max_pct)
+        cash_reserve_pct = st.slider(
+            "Cash reserve to retain (% of total portfolio)",
+            min_value=0,
+            max_value=reserve_max_pct,
+            value=reserve_default_pct,
+            step=1,
+            help="The reserve is held as cash and is not exposed to equity market risk. It cannot exceed your currently available cash for a no-forced-sale plan.",
+        )
+        cash_reserve_weight = cash_reserve_pct / 100.0
+        equity_budget = 1.0 - cash_reserve_weight
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Existing investments", money(existing_market_value))
+        c2.metric("Fresh cash available", money(fresh_capital))
+        c3.metric("Total portfolio value", money(total_portfolio_value))
+        st.caption(
+            f"Current mix: {current_w.sum():.1%} in the 10 supported equities and {current_cash:.1%} in cash. "
+            f"Risk preference: {profile.get('risk_profile', 'Moderate')} (γ = {gamma}). "
+            f"Planning horizon: {horizon_years:.0f} years (used to amortize one-time trading costs)."
+        )
+        cap_infeasible = len(TICKERS) * max_weight < equity_budget - 1e-9
+        reserve_infeasible = float(current_w.sum()) > equity_budget + 1e-9
+        if cap_infeasible:
+            st.error(
+                f"The stock cap is infeasible for the selected {equity_budget:.0%} equity target. "
+                f"Increase the cap to at least {equity_budget / len(TICKERS):.1%}."
+            )
+        if reserve_infeasible:
+            st.error("The selected cash reserve exceeds the cash currently available. Reduce the reserve.")
+
+        if st.button(
+            "Generate investment plans",
+            type="primary",
+            width="stretch",
+            disabled=(cap_infeasible or reserve_infeasible),
+        ):
             try:
-                portfolios = generate_portfolios(
+                plans = generate_investment_plans(
                     mu.to_numpy(dtype=float),
                     covariance.to_numpy(dtype=float),
-                    current_weights.reindex(TICKERS).to_numpy(dtype=float),
+                    current_w.to_numpy(dtype=float),
                     gamma,
                     max_weight,
                     cost_rate,
+                    cash_reserve_weight=cash_reserve_weight,
+                    horizon_years=horizon_years,
                 )
-                st.session_state.optimization_result = {
-                    "portfolios": portfolios,
+                st.session_state.investment_plans = {
+                    "plans": plans,
                     "covariance_name": covariance_choice,
                     "cost_rate": cost_rate,
-                    "total_value": total_portfolio_value,
-                    "current_weights": current_weights.copy(),
+                    "total_value": float(total_portfolio_value),
+                    "current_weights": current_w.copy(),
                     "expected_returns": mu.copy(),
                     "covariance": covariance.copy(),
+                    "latest_prices": latest_prices.reindex(TICKERS).copy(),
                     "latest_date": str(latest_date.date()),
+                    "max_weight": max_weight,
+                    "risk_aversion": gamma,
+                    "cash_reserve_weight": cash_reserve_weight,
+                    "horizon_years": horizon_years,
                 }
-                st.success("Optimization completed. Review the strategy comparison below.")
+                st.success("Investment plans generated. Compare the strategies below.")
             except Exception as exc:
-                st.error(f"Optimization failed: {exc}")
+                st.error(f"Plan generation failed: {exc}")
 
-        result_state = st.session_state.get("optimization_result")
+        result_state = st.session_state.get("investment_plans")
         if result_state:
-            portfolios = result_state["portfolios"]
-            strategies = {
-                "Equal weight": portfolios["equal_weight"],
-                "Markowitz": portfolios["markowitz"]["weights"],
-                "Transaction-cost-aware": portfolios["cost_aware"]["weights"],
+            plans = result_state["plans"]
+            plan_labels = {
+                "Fresh-capital-first": "fresh_capital_first",
+                "Full rebalance": "full_rebalance",
+                "Transaction-cost-aware": "cost_aware",
             }
-            comparison_rows = []
-            strategy_weights = {}
-            for label, raw_weights in strategies.items():
-                weights_series = pd.Series(np.asarray(raw_weights, dtype=float), index=TICKERS)
-                strategy_weights[label] = weights_series
-                stats = portfolio_risk_metrics(weights_series, {
-                    "expected_returns": result_state["expected_returns"],
-                    "sample_covariance": result_state["covariance"],
-                    "beta": metrics["beta"],
-                })
-                comparison_rows.append({
-                    "Strategy": label,
-                    "Expected annual return": stats["expected_return"],
-                    "Annual volatility": stats["volatility"],
-                    "Beta": stats["beta"],
-                    "Sharpe ratio (6% RF)": stats["sharpe"],
-                })
-            comparison = pd.DataFrame(comparison_rows)
-            st.markdown("#### Strategy comparison")
-            display_comparison = comparison.copy()
-            for col in ["Expected annual return", "Annual volatility"]:
-                display_comparison[col] = display_comparison[col].map(lambda x: f"{x:.2%}")
-            display_comparison["Beta"] = display_comparison["Beta"].map(lambda x: f"{x:.2f}")
-            display_comparison["Sharpe ratio (6% RF)"] = display_comparison["Sharpe ratio (6% RF)"].map(lambda x: f"{x:.2f}")
-            st.dataframe(display_comparison, width="stretch", hide_index=True)
-
-            weights_long = pd.concat([series.rename(label) for label, series in strategy_weights.items()], axis=1).reset_index(names="Stock")
-            weights_long = weights_long.melt(id_vars="Stock", var_name="Strategy", value_name="Weight")
-            fig_weights = px.bar(weights_long, x="Stock", y="Weight", color="Strategy", barmode="group", title="Recommended stock weights by strategy")
-            fig_weights.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig_weights, width="stretch")
-
-            selected_strategy = st.selectbox("Inspect allocation and trades", list(strategy_weights.keys()), key="inspect_strategy")
-            target_weights = strategy_weights[selected_strategy]
-            current_w = result_state["current_weights"].reindex(TICKERS).fillna(0.0)
+            rows = []
+            weights_by_label = {}
             nav = float(result_state["total_value"])
-            trade_df = calculate_buy_sell(current_w.to_numpy(), target_weights.to_numpy(), nav)
-            trade_df.index = TICKERS
-            trade_df = trade_df.rename_axis("Stock").reset_index()
-            trade_df["Target Weight"] = target_weights.values
-            trade_df["Current Holding Value (₹)"] = current_w.values * nav
-            trade_df["Target Holding Value (₹)"] = target_weights.values * nav
-            trade_df["Buy Amount (₹)"] = trade_df["Buy Amount"]
-            trade_df["Sell Amount (₹)"] = trade_df["Sell Amount"]
-            trade_df["Estimated Shares to Buy"] = np.floor(trade_df["Buy Amount (₹)"].to_numpy() / latest_prices.reindex(TICKERS).to_numpy())
-            trade_df["Estimated Shares to Sell"] = np.floor(trade_df["Sell Amount (₹)"].to_numpy() / latest_prices.reindex(TICKERS).to_numpy())
+            current = result_state["current_weights"].reindex(TICKERS).fillna(0.0)
+            for label, key in plan_labels.items():
+                plan = plans[key]
+                w = pd.Series(plan["weights"], index=TICKERS, dtype=float)
+                weights_by_label[label] = w
+                variance = float(w.to_numpy() @ result_state["covariance"].to_numpy() @ w.to_numpy())
+                vol = float(np.sqrt(max(variance, 0.0)))
+                ret = float(w.to_numpy() @ result_state["expected_returns"].to_numpy())
+                gross_trade_weight = float(np.abs(w.to_numpy() - current.to_numpy()).sum())
+                one_time_cost = gross_trade_weight * nav * result_state["cost_rate"]
+                annualized_cost_drag = (
+                    one_time_cost / nav / result_state["horizon_years"]
+                    if nav > 0 else 0.0
+                )
+                rows.append({
+                    "Strategy": label,
+                    "Gross expected annual return": ret,
+                    "Annualized cost drag": annualized_cost_drag,
+                    "Estimated net annual return": ret - annualized_cost_drag,
+                    "Annual volatility": vol,
+                    "Cash retained": plan["cash_weight"],
+                    "Estimated one-time trading cost": one_time_cost,
+                })
+            comparison = pd.DataFrame(rows)
+            st.markdown("#### Compare the three plans")
+            display = comparison.copy()
+            for col in [
+                "Gross expected annual return",
+                "Annualized cost drag",
+                "Estimated net annual return",
+                "Annual volatility",
+                "Cash retained",
+            ]:
+                display[col] = display[col].map(lambda x: f"{x:.2%}")
+            display["Estimated one-time trading cost"] = display[
+                "Estimated one-time trading cost"
+            ].map(money)
+            st.dataframe(display, width="stretch", hide_index=True)
+            st.caption(
+                "Returns and volatility are historical estimates on total portfolio value. "
+                "Cash is assumed to earn 0% and have 0% volatility. "
+                "One-time proportional trading costs are amortized over the selected planning horizon "
+                "for the cost-aware objective. These are not forecasts or guarantees."
+            )
 
-            cost_info = calculate_transaction_cost(current_w.to_numpy(), target_weights.to_numpy(), nav, result_state["cost_rate"])
-            st.markdown(f"#### {selected_strategy}: allocation and trade plan")
-            a1, a2, a3 = st.columns(3)
-            a1.metric("Estimated gross traded amount", money(cost_info["traded_amount"]))
-            a2.metric("Estimated transaction cost", money(cost_info["transaction_cost"]))
-            a3.metric("One-way turnover", f"{cost_info['turnover']:.2%}")
-            st.dataframe(trade_df[["Stock", "Current Holding Value (₹)", "Target Weight", "Target Holding Value (₹)", "Buy Amount (₹)", "Sell Amount (₹)", "Estimated Shares to Buy", "Estimated Shares to Sell"]], width="stretch", hide_index=True,
-                         column_config={
-                             "Current Holding Value (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-                             "Target Weight": st.column_config.NumberColumn(format="%.2%"),
-                             "Target Holding Value (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-                             "Buy Amount (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-                             "Sell Amount (₹)": st.column_config.NumberColumn(format="₹%.2f"),
-                         })
-            st.caption("Share quantities are approximate whole-share estimates. They exclude lot-size, price movement, taxes, brokerage slabs and minimum charges. This is a recommendation simulation, not an order.")
-            st.download_button("Download selected allocation CSV", data=trade_df.to_csv(index=False).encode("utf-8"), file_name="investwise_recommended_allocation.csv", mime="text/csv")
+            weights_long = pd.concat([s.rename(label) for label, s in weights_by_label.items()], axis=1).reset_index(names="Stock")
+            weights_long = weights_long.melt(id_vars="Stock", var_name="Strategy", value_name="Final portfolio weight")
+            fig = px.bar(weights_long, x="Stock", y="Final portfolio weight", color="Strategy", barmode="group", title="Final stock allocation as a share of total portfolio value")
+            fig.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig, width="stretch")
 
+            selected = st.selectbox("Inspect a plan", list(weights_by_label.keys()), key="investment_plan_to_inspect")
+            target = weights_by_label[selected]
+            delta = target - current
+            buy_weights = np.maximum(delta.to_numpy(), 0.0)
+            sell_weights = np.maximum(-delta.to_numpy(), 0.0)
+            buys = buy_weights * nav
+            sells = sell_weights * nav
+            gross_traded = float(buys.sum() + sells.sum())
+            estimated_cost = gross_traded * result_state["cost_rate"]
+            # With external fresh cash, gross trading/NAV is the transparent
+            # turnover measure; the conventional half-L1 formula assumes no flows.
+            turnover = gross_traded / nav if nav > 0 else 0.0
+            plan_cash = max(0.0, 1.0 - float(target.sum()))
+            st.markdown(f"#### {selected}: proposed actions")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Amount to buy", money(float(buys.sum())))
+            m2.metric("Amount to sell", money(float(sells.sum())))
+            m3.metric("Estimated trading cost", money(estimated_cost))
+            m4.metric("Cash after plan", money(plan_cash * nav))
+
+            trade_df = pd.DataFrame({
+                "Stock": TICKERS,
+                "Current value (₹)": current.to_numpy() * nav,
+                "Recommended final weight": target.to_numpy(),
+                "Recommended final value (₹)": target.to_numpy() * nav,
+                "Buy amount (₹)": buys,
+                "Sell amount (₹)": sells,
+                "Approx. shares to buy": np.floor(buys / result_state["latest_prices"].to_numpy()),
+                "Approx. shares to sell": np.floor(sells / result_state["latest_prices"].to_numpy()),
+            })
+            st.dataframe(trade_df, width="stretch", hide_index=True, column_config={
+                "Current value (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Recommended final weight": st.column_config.NumberColumn(format="%.2%"),
+                "Recommended final value (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Buy amount (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Sell amount (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Approx. shares to buy": st.column_config.NumberColumn(format="%d"),
+                "Approx. shares to sell": st.column_config.NumberColumn(format="%d"),
+            })
+            st.caption(f"Gross trading amount: {money(gross_traded)} ({turnover:.2%} of total portfolio value). Estimated costs use {cost_bps} bps. Share quantities are approximate whole shares and exclude taxes, brokerage slabs, lot-size rules and price movement. This is a simulation, not an order.")
+            if selected == "Fresh-capital-first":
+                st.info("This plan does not sell existing positions. It allocates available fresh cash subject to the risk model and stock caps; any amount not allocated remains cash.")
+            elif selected == "Full rebalance":
+                st.warning("This plan may sell existing positions and deploy all portfolio value into equities. Estimated costs are shown separately and are not deducted from the target weights.")
+            else:
+                st.info("This plan may buy and sell, but its objective penalizes changes from current holdings to discourage unnecessary turnover. Estimated costs are shown separately.")
+            st.download_button("Download this plan as CSV", data=trade_df.to_csv(index=False).encode("utf-8"), file_name="investwise_investment_plan.csv", mime="text/csv")
 
     # ============================================================
 
