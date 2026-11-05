@@ -141,8 +141,10 @@ if st.sidebar.button("↻ Refresh market data", width="stretch"):
     with st.spinner("Fetching latest available market data..."):
         try:
             _, refresh_status = refresh_market_data(force_refresh=True)
-            load_prices_cached.clear()
-            st.sidebar.success(refresh_status.get("message", "Refresh completed."))
+            if refresh_status.get("updated"):
+                st.sidebar.success(refresh_status.get("message", "Refresh completed."))
+            else:
+                st.sidebar.warning(refresh_status.get("message", "Using existing local data."))
             st.sidebar.caption(f"Latest date: {refresh_status.get('last_date', 'Unknown')}")
         except Exception as exc:
             st.sidebar.error(f"Refresh failed: {exc}")
@@ -172,14 +174,11 @@ else:
     st.sidebar.caption(f"Latest available observation: {latest_date:%d %b %Y}")
     st.sidebar.caption(f"{len(prices):,} aligned trading observations · {len(TICKERS)} equities + NIFTY 50")
 
-# Tabs are deliberately used instead of one long scrolling form.
+# Three simple investor-facing sections; advanced tools are tucked into expanders.
 tabs = st.tabs([
-    "Overview",
-    "My Portfolio",
-    "Portfolio Analytics",
-    "Optimize Portfolio",
-    "Backtesting & Research",
-    "Investor Settings",
+    "🏠 Home",
+    "💼 My Investments",
+    "🧭 Investment Planner",
 ])
 
 
@@ -199,9 +198,8 @@ total_portfolio_value = existing_market_value + fresh_capital
 current_weights = holding_values / total_portfolio_value if total_portfolio_value > 0 else holding_values.copy()
 current_cash_weight = fresh_capital / total_portfolio_value if total_portfolio_value > 0 else 1.0
 
-
 # ============================================================
-# TAB 1: OVERVIEW
+# HOME
 # ============================================================
 with tabs[0]:
     st.subheader("Portfolio at a glance")
@@ -240,8 +238,91 @@ with tabs[0]:
         st.info("You have no existing stock holdings. Your fresh capital is ready for the optimization stage.")
 
 
+    # ============================================================
+
+    with st.expander("Advanced analytics", expanded=False):
+        st.subheader("Portfolio Analytics")
+        st.caption("Historical and statistical analysis based on the cached price history.")
+        if prices is None:
+            st.warning("Load market data to view analytics.")
+        else:
+            with st.spinner("Calculating return, risk and correlation statistics..."):
+                metrics = calculate_metrics(prices)
+
+            mu = metrics["expected_returns"].reindex(TICKERS)
+            vol = metrics["volatility"].reindex(TICKERS)
+            beta = metrics["beta"].reindex(TICKERS)
+            stock_sharpe = metrics["stock_sharpe"].reindex(TICKERS)
+
+            st.markdown("#### Stock universe: risk versus return")
+            risk_return = pd.DataFrame({
+                "Stock": TICKERS,
+                "Expected annual return (%)": mu.values * 100,
+                "Annual volatility (%)": vol.values * 100,
+                "Beta": beta.values,
+                "Sharpe ratio": stock_sharpe.values,
+            })
+            fig_scatter = px.scatter(risk_return, x="Annual volatility (%)", y="Expected annual return (%)", text="Stock", size="Beta", color="Sharpe ratio", hover_data=["Beta"])
+            fig_scatter.update_traces(textposition="top center")
+            fig_scatter.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_scatter, width="stretch")
+
+            st.markdown("#### Historical normalized price performance")
+            selected_assets = st.multiselect("Choose stocks / benchmark", TICKERS + [BENCHMARK], default=["TCS.NS", "HDFCBANK.NS", "RELIANCE.NS", BENCHMARK])
+            if selected_assets:
+                normalized = prices[selected_assets].div(prices[selected_assets].iloc[0]).mul(100)
+                fig_norm = px.line(normalized, x=normalized.index, y=selected_assets, labels={"value": "Growth of ₹100 (index)", "Date": "Date", "variable": "Asset"})
+                st.plotly_chart(fig_norm, width="stretch")
+
+            st.markdown("#### Return correlation heatmap")
+            corr = metrics["correlation"].reindex(index=TICKERS, columns=TICKERS)
+            fig_corr = px.imshow(corr, x=TICKERS, y=TICKERS, zmin=-1, zmax=1, color_continuous_scale="RdBu_r", text_auto=".2f", aspect="auto")
+            fig_corr.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_corr, width="stretch")
+
+            st.markdown("#### Individual stock metrics")
+            st.dataframe(risk_return.sort_values("Sharpe ratio", ascending=False), width="stretch", hide_index=True)
+
+            if existing_market_value > 0:
+                st.markdown("#### Current holdings: historical fixed-quantity illustration")
+                history = make_portfolio_history(prices, holdings, fresh_capital)
+                if history is not None:
+                    hist_df = pd.DataFrame({"Portfolio value (₹)": history})
+                    fig_hist = px.line(hist_df, x=hist_df.index, y="Portfolio value (₹)")
+                    st.plotly_chart(fig_hist, width="stretch")
+                    daily_hist_returns = history.pct_change().dropna()
+                    if not daily_hist_returns.empty:
+                        rolling_vol = daily_hist_returns.rolling(63).std() * np.sqrt(TRADING_DAYS) * 100
+                        fig_vol = px.line(rolling_vol, x=rolling_vol.index, y=rolling_vol.values, labels={"x": "Date", "y": "Rolling 63-day annualized volatility (%)"}, title="Rolling 63-trading-day volatility")
+                        st.plotly_chart(fig_vol, width="stretch")
+
+                        historical_drawdown = history / history.cummax() - 1
+                        fig_portfolio_dd = px.area(
+                            historical_drawdown,
+                            x=historical_drawdown.index,
+                            y=historical_drawdown.values,
+                            labels={"x": "Date", "y": "Drawdown"},
+                            title="Historical drawdown of the illustrative holdings basket",
+                        )
+                        fig_portfolio_dd.update_yaxes(tickformat=".0%")
+                        st.plotly_chart(fig_portfolio_dd, width="stretch")
+                    st.caption("This chart reconstructs the historical value of today's share quantities plus constant fresh cash. It is a hypothetical fixed-quantity illustration, not the user's actual historical account performance.")
+
+            if existing_market_value > 0:
+                current_risk = portfolio_risk_metrics(current_weights, metrics)
+                st.markdown("#### Existing portfolio risk snapshot (cash assumed risk-free)")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Estimated annual return", f"{current_risk['expected_return']:.2%}")
+                r2.metric("Estimated annual volatility", f"{current_risk['volatility']:.2%}")
+                r3.metric("Portfolio beta", f"{current_risk['beta']:.2f}")
+                r4.metric("Sharpe ratio", f"{current_risk['sharpe']:.2f}" if pd.notna(current_risk["sharpe"]) else "N/A")
+                st.caption("These are model estimates using the full selected historical sample, 6% risk-free rate and zero-return/zero-risk cash simplification. They are not forecasts.")
+
+
+        # ============================================================
+
 # ============================================================
-# TAB 2: MY PORTFOLIO
+# MY INVESTMENTS
 # ============================================================
 with tabs[1]:
     st.subheader("My Portfolio")
@@ -288,92 +369,92 @@ with tabs[1]:
     st.caption("Yahoo Finance historical adjusted-close data is used as a prototype data source. It may be delayed, revised or unavailable; it is not an executable broker quote.")
 
 
+    # ============================================================
+
+    with st.expander("Profile & settings", expanded=False):
+        st.subheader("Investor Settings")
+        st.markdown("#### Investment preferences")
+        with st.form("settings_profile_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                setting_capital = st.number_input("Additional fresh investment capital (₹)", min_value=1000.0, value=float(profile.get("capital", 100000)), step=5000.0)
+                setting_risk = st.selectbox("Risk preference", list(RISK_PROFILES.keys()), index=list(RISK_PROFILES.keys()).index(profile.get("risk_profile", "Moderate")))
+                setting_max = st.slider("Maximum weight per stock (%)", 10, 100, int(float(profile.get("max_weight", .30)) * 100), 5)
+            with c2:
+                horizon_options = ["Short-term (up to 1 year)", "Medium-term (1–3 years)", "Long-term (above 3 years)"]
+                setting_horizon = st.selectbox("Investment horizon", horizon_options, index=horizon_options.index(profile.get("investment_horizon", horizon_options[2])))
+                setting_target = st.number_input("Target annual return (%)", min_value=0.0, max_value=100.0, value=float(profile.get("target_return", 12.0)), step=1.0)
+            if st.form_submit_button("Save investor settings", type="primary"):
+                updated = {
+                    "profile_id": profile.get("profile_id", "default_user"),
+                    "capital": setting_capital,
+                    "risk_profile": setting_risk,
+                    "investment_horizon": setting_horizon,
+                    "target_return": setting_target,
+                    "max_weight": setting_max / 100,
+                }
+                save_profile(updated)
+                st.session_state.profile = updated
+                st.success("Investor settings saved. Rerun the app to refresh all dependent calculations.")
+
+        st.divider()
+        st.markdown("#### Manage existing holdings")
+        holdings_editor_df = pd.DataFrame(st.session_state.holdings, columns=["Ticker", "Quantity", "Average Purchase Price"])
+        if holdings_editor_df.empty:
+            holdings_editor_df = pd.DataFrame(columns=["Ticker", "Quantity", "Average Purchase Price"])
+        edited = st.data_editor(
+            holdings_editor_df,
+            num_rows="dynamic",
+            width="stretch",
+            key="settings_holdings_editor",
+            column_config={
+                "Ticker": st.column_config.SelectboxColumn("Stock ticker", options=TICKERS, required=True),
+                "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1),
+                "Average Purchase Price": st.column_config.NumberColumn("Average purchase price (₹)", min_value=0.0, format="₹%.2f"),
+            },
+        )
+        if st.button("Save holdings", key="save_settings_holdings"):
+            clean = []
+            errors = []
+            for _, row in edited.iterrows():
+                ticker = row.get("Ticker")
+                if pd.isna(ticker) or not str(ticker).strip():
+                    continue
+                ticker = str(ticker).strip().upper()
+                qty = row.get("Quantity")
+                purchase = row.get("Average Purchase Price")
+                if ticker not in TICKERS:
+                    errors.append(f"Unsupported ticker: {ticker}")
+                    continue
+                if pd.isna(qty) or qty <= 0 or not float(qty).is_integer():
+                    errors.append(f"Enter a positive whole-share quantity for {ticker}")
+                    continue
+                if pd.notna(purchase) and purchase < 0:
+                    errors.append(f"Invalid purchase price for {ticker}")
+                    continue
+                clean.append({"Ticker": ticker, "Quantity": int(qty), "Average Purchase Price": float(purchase) if pd.notna(purchase) else None})
+            if errors:
+                for err in errors:
+                    st.error(err)
+            else:
+                save_holdings(clean)
+                st.session_state.holdings = clean
+                st.success("Holdings saved. Rerun the app to refresh portfolio calculations.")
+
+        st.divider()
+        st.markdown("#### Data and model assumptions")
+        st.write(f"Supported universe: {', '.join(TICKERS)}")
+        st.write(f"Benchmark: {BENCHMARK}")
+        st.write(f"Risk-free rate used by the supplied engine: 6% annually")
+        st.write("Cash is treated as zero-return and zero-risk in the current portfolio snapshot. The optimizer itself allocates 100% across the supported equities.")
+        st.write("Market prices are sourced from the local CSV cache populated by Yahoo Finance historical data downloads.")
+
+        st.divider()
+
 # ============================================================
-# TAB 3: PORTFOLIO ANALYTICS
+# INVESTMENT PLANNER
 # ============================================================
 with tabs[2]:
-    st.subheader("Portfolio Analytics")
-    st.caption("Historical and statistical analysis based on the cached price history.")
-    if prices is None:
-        st.warning("Load market data to view analytics.")
-    else:
-        with st.spinner("Calculating return, risk and correlation statistics..."):
-            metrics = calculate_metrics(prices)
-
-        mu = metrics["expected_returns"].reindex(TICKERS)
-        vol = metrics["volatility"].reindex(TICKERS)
-        beta = metrics["beta"].reindex(TICKERS)
-        stock_sharpe = metrics["stock_sharpe"].reindex(TICKERS)
-
-        st.markdown("#### Stock universe: risk versus return")
-        risk_return = pd.DataFrame({
-            "Stock": TICKERS,
-            "Expected annual return (%)": mu.values * 100,
-            "Annual volatility (%)": vol.values * 100,
-            "Beta": beta.values,
-            "Sharpe ratio": stock_sharpe.values,
-        })
-        fig_scatter = px.scatter(risk_return, x="Annual volatility (%)", y="Expected annual return (%)", text="Stock", size="Beta", color="Sharpe ratio", hover_data=["Beta"])
-        fig_scatter.update_traces(textposition="top center")
-        fig_scatter.update_layout(margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_scatter, width="stretch")
-
-        st.markdown("#### Historical normalized price performance")
-        selected_assets = st.multiselect("Choose stocks / benchmark", TICKERS + [BENCHMARK], default=["TCS.NS", "HDFCBANK.NS", "RELIANCE.NS", BENCHMARK])
-        if selected_assets:
-            normalized = prices[selected_assets].div(prices[selected_assets].iloc[0]).mul(100)
-            fig_norm = px.line(normalized, x=normalized.index, y=selected_assets, labels={"value": "Growth of ₹100 (index)", "Date": "Date", "variable": "Asset"})
-            st.plotly_chart(fig_norm, width="stretch")
-
-        st.markdown("#### Return correlation heatmap")
-        corr = metrics["correlation"].reindex(index=TICKERS, columns=TICKERS)
-        fig_corr = px.imshow(corr, x=TICKERS, y=TICKERS, zmin=-1, zmax=1, color_continuous_scale="RdBu_r", text_auto=".2f", aspect="auto")
-        fig_corr.update_layout(height=650, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_corr, width="stretch")
-
-        st.markdown("#### Individual stock metrics")
-        st.dataframe(risk_return.sort_values("Sharpe ratio", ascending=False), width="stretch", hide_index=True)
-
-        if existing_market_value > 0:
-            st.markdown("#### Current holdings: historical fixed-quantity illustration")
-            history = make_portfolio_history(prices, holdings, fresh_capital)
-            if history is not None:
-                hist_df = pd.DataFrame({"Portfolio value (₹)": history})
-                fig_hist = px.line(hist_df, x=hist_df.index, y="Portfolio value (₹)")
-                st.plotly_chart(fig_hist, width="stretch")
-                daily_hist_returns = history.pct_change().dropna()
-                if not daily_hist_returns.empty:
-                    rolling_vol = daily_hist_returns.rolling(63).std() * np.sqrt(TRADING_DAYS) * 100
-                    fig_vol = px.line(rolling_vol, x=rolling_vol.index, y=rolling_vol.values, labels={"x": "Date", "y": "Rolling 63-day annualized volatility (%)"}, title="Rolling 63-trading-day volatility")
-                    st.plotly_chart(fig_vol, width="stretch")
-
-                    historical_drawdown = history / history.cummax() - 1
-                    fig_portfolio_dd = px.area(
-                        historical_drawdown,
-                        x=historical_drawdown.index,
-                        y=historical_drawdown.values,
-                        labels={"x": "Date", "y": "Drawdown"},
-                        title="Historical drawdown of the illustrative holdings basket",
-                    )
-                    fig_portfolio_dd.update_yaxes(tickformat=".0%")
-                    st.plotly_chart(fig_portfolio_dd, width="stretch")
-                st.caption("This chart reconstructs the historical value of today's share quantities plus constant fresh cash. It is a hypothetical fixed-quantity illustration, not the user's actual historical account performance.")
-
-        if existing_market_value > 0:
-            current_risk = portfolio_risk_metrics(current_weights, metrics)
-            st.markdown("#### Existing portfolio risk snapshot (cash assumed risk-free)")
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("Estimated annual return", f"{current_risk['expected_return']:.2%}")
-            r2.metric("Estimated annual volatility", f"{current_risk['volatility']:.2%}")
-            r3.metric("Portfolio beta", f"{current_risk['beta']:.2f}")
-            r4.metric("Sharpe ratio", f"{current_risk['sharpe']:.2f}" if pd.notna(current_risk["sharpe"]) else "N/A")
-            st.caption("These are model estimates using the full selected historical sample, 6% risk-free rate and zero-return/zero-risk cash simplification. They are not forecasts.")
-
-
-# ============================================================
-# TAB 4: OPTIMIZATION
-# ============================================================
-with tabs[3]:
     st.subheader("Optimize Portfolio")
     st.caption("Compare allocation strategies using the selected historical estimates and your current holdings.")
     if prices is None:
@@ -490,140 +571,60 @@ with tabs[3]:
             st.download_button("Download selected allocation CSV", data=trade_df.to_csv(index=False).encode("utf-8"), file_name="investwise_recommended_allocation.csv", mime="text/csv")
 
 
-# ============================================================
-# TAB 5: BACKTESTING AND RESEARCH
-# ============================================================
-with tabs[4]:
-    st.subheader("Backtesting & Research")
-    st.caption("Historical walk-forward strategy comparison implemented by the quantitative engine.")
-    if prices is None:
-        st.warning("Market data is required for backtesting.")
-    else:
-        st.write("The supplied backtest evaluates quarterly rebalancing over its configured out-of-sample period (2024–2025). It starts with the selected initial capital and does not model your personal historical holdings.")
-        bt_capital = st.number_input("Backtest initial capital (₹)", min_value=10000.0, value=fresh_capital, step=10000.0, key="bt_capital")
-        bt_cost_bps = st.slider("Backtest transaction cost (basis points)", min_value=0, max_value=50, value=10, key="bt_cost")
-        if st.button("Run historical backtest", type="primary"):
-            try:
-                with st.spinner("Running quarterly walk-forward backtest..."):
-                    backtest_result = run_backtest(
-                        prices,
-                        initial_capital=bt_capital,
-                        risk_profile=profile.get("risk_profile", "Moderate"),
-                        max_weight=float(profile.get("max_weight", 0.30)),
-                        transaction_cost_rate=bt_cost_bps / 10000,
-                    )
-                st.session_state.backtest_result = backtest_result
-                st.success("Backtest completed.")
-            except Exception as exc:
-                st.error(f"Backtest failed: {exc}")
+    # ============================================================
 
-        bt = st.session_state.get("backtest_result")
-        if bt:
-            nav_df = bt["nav"].dropna(how="all")
-            perf = bt["performance"]
-            if not nav_df.empty:
-                fig_nav = px.line(nav_df, x=nav_df.index, y=nav_df.columns, title="Walk-forward portfolio NAV")
-                st.plotly_chart(fig_nav, width="stretch")
-                summary = pd.DataFrame(perf).T
-                st.markdown("#### Performance summary")
-                st.dataframe(summary.style.format({
-                    "total_return": "{:.2%}",
-                    "annual_return": "{:.2%}",
-                    "annual_volatility": "{:.2%}",
-                    "sharpe": "{:.2f}",
-                    "max_drawdown": "{:.2%}",
-                    "transaction_cost": "₹{:,.2f}",
-                    "turnover": "{:.2f}",
-                }, na_rep="—"), width="stretch")
-                daily_returns = nav_df.pct_change().dropna()
-                if not daily_returns.empty:
-                    drawdown = nav_df.div(nav_df.cummax()).sub(1)
-                    fig_dd = px.line(drawdown, x=drawdown.index, y=drawdown.columns, title="Drawdown through the backtest")
-                    fig_dd.update_yaxes(tickformat=".0%")
-                    st.plotly_chart(fig_dd, width="stretch")
-                    st.download_button("Download backtest NAV CSV", data=nav_df.to_csv().encode("utf-8"), file_name="investwise_backtest_nav.csv", mime="text/csv")
-
-
-# ============================================================
-# TAB 6: INVESTOR SETTINGS
-# ============================================================
-with tabs[5]:
-    st.subheader("Investor Settings")
-    st.markdown("#### Investment preferences")
-    with st.form("settings_profile_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            setting_capital = st.number_input("Additional fresh investment capital (₹)", min_value=1000.0, value=float(profile.get("capital", 100000)), step=5000.0)
-            setting_risk = st.selectbox("Risk preference", list(RISK_PROFILES.keys()), index=list(RISK_PROFILES.keys()).index(profile.get("risk_profile", "Moderate")))
-            setting_max = st.slider("Maximum weight per stock (%)", 10, 100, int(float(profile.get("max_weight", .30)) * 100), 5)
-        with c2:
-            horizon_options = ["Short-term (up to 1 year)", "Medium-term (1–3 years)", "Long-term (above 3 years)"]
-            setting_horizon = st.selectbox("Investment horizon", horizon_options, index=horizon_options.index(profile.get("investment_horizon", horizon_options[2])))
-            setting_target = st.number_input("Target annual return (%)", min_value=0.0, max_value=100.0, value=float(profile.get("target_return", 12.0)), step=1.0)
-        if st.form_submit_button("Save investor settings", type="primary"):
-            updated = {
-                "profile_id": profile.get("profile_id", "default_user"),
-                "capital": setting_capital,
-                "risk_profile": setting_risk,
-                "investment_horizon": setting_horizon,
-                "target_return": setting_target,
-                "max_weight": setting_max / 100,
-            }
-            save_profile(updated)
-            st.session_state.profile = updated
-            st.success("Investor settings saved. Rerun the app to refresh all dependent calculations.")
-
-    st.divider()
-    st.markdown("#### Manage existing holdings")
-    holdings_editor_df = pd.DataFrame(st.session_state.holdings, columns=["Ticker", "Quantity", "Average Purchase Price"])
-    if holdings_editor_df.empty:
-        holdings_editor_df = pd.DataFrame(columns=["Ticker", "Quantity", "Average Purchase Price"])
-    edited = st.data_editor(
-        holdings_editor_df,
-        num_rows="dynamic",
-        width="stretch",
-        key="settings_holdings_editor",
-        column_config={
-            "Ticker": st.column_config.SelectboxColumn("Stock ticker", options=TICKERS, required=True),
-            "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1),
-            "Average Purchase Price": st.column_config.NumberColumn("Average purchase price (₹)", min_value=0.0, format="₹%.2f"),
-        },
-    )
-    if st.button("Save holdings", key="save_settings_holdings"):
-        clean = []
-        errors = []
-        for _, row in edited.iterrows():
-            ticker = row.get("Ticker")
-            if pd.isna(ticker) or not str(ticker).strip():
-                continue
-            ticker = str(ticker).strip().upper()
-            qty = row.get("Quantity")
-            purchase = row.get("Average Purchase Price")
-            if ticker not in TICKERS:
-                errors.append(f"Unsupported ticker: {ticker}")
-                continue
-            if pd.isna(qty) or qty <= 0 or not float(qty).is_integer():
-                errors.append(f"Enter a positive whole-share quantity for {ticker}")
-                continue
-            if pd.notna(purchase) and purchase < 0:
-                errors.append(f"Invalid purchase price for {ticker}")
-                continue
-            clean.append({"Ticker": ticker, "Quantity": int(qty), "Average Purchase Price": float(purchase) if pd.notna(purchase) else None})
-        if errors:
-            for err in errors:
-                st.error(err)
+    with st.expander("Backtesting & research", expanded=False):
+        st.subheader("Backtesting & Research")
+        st.caption("Historical walk-forward strategy comparison implemented by the quantitative engine.")
+        if prices is None:
+            st.warning("Market data is required for backtesting.")
         else:
-            save_holdings(clean)
-            st.session_state.holdings = clean
-            st.success("Holdings saved. Rerun the app to refresh portfolio calculations.")
+            st.write("The supplied backtest evaluates quarterly rebalancing over its configured out-of-sample period (2024–2025). It starts with the selected initial capital and does not model your personal historical holdings.")
+            bt_capital = st.number_input("Backtest initial capital (₹)", min_value=10000.0, value=fresh_capital, step=10000.0, key="bt_capital")
+            bt_cost_bps = st.slider("Backtest transaction cost (basis points)", min_value=0, max_value=50, value=10, key="bt_cost")
+            if st.button("Run historical backtest", type="primary"):
+                try:
+                    with st.spinner("Running quarterly walk-forward backtest..."):
+                        backtest_result = run_backtest(
+                            prices,
+                            initial_capital=bt_capital,
+                            risk_profile=profile.get("risk_profile", "Moderate"),
+                            max_weight=float(profile.get("max_weight", 0.30)),
+                            transaction_cost_rate=bt_cost_bps / 10000,
+                        )
+                    st.session_state.backtest_result = backtest_result
+                    st.success("Backtest completed.")
+                except Exception as exc:
+                    st.error(f"Backtest failed: {exc}")
 
-    st.divider()
-    st.markdown("#### Data and model assumptions")
-    st.write(f"Supported universe: {', '.join(TICKERS)}")
-    st.write(f"Benchmark: {BENCHMARK}")
-    st.write(f"Risk-free rate used by the supplied engine: 6% annually")
-    st.write("Cash is treated as zero-return and zero-risk in the current portfolio snapshot. The optimizer itself allocates 100% across the supported equities.")
-    st.write("Market prices are sourced from the local CSV cache populated by Yahoo Finance historical data downloads.")
+            bt = st.session_state.get("backtest_result")
+            if bt:
+                nav_df = bt["nav"].dropna(how="all")
+                perf = bt["performance"]
+                if not nav_df.empty:
+                    fig_nav = px.line(nav_df, x=nav_df.index, y=nav_df.columns, title="Walk-forward portfolio NAV")
+                    st.plotly_chart(fig_nav, width="stretch")
+                    summary = pd.DataFrame(perf).T
+                    st.markdown("#### Performance summary")
+                    st.dataframe(summary.style.format({
+                        "total_return": "{:.2%}",
+                        "annual_return": "{:.2%}",
+                        "annual_volatility": "{:.2%}",
+                        "sharpe": "{:.2f}",
+                        "max_drawdown": "{:.2%}",
+                        "transaction_cost": "₹{:,.2f}",
+                        "turnover": "{:.2f}",
+                    }, na_rep="—"), width="stretch")
+                    daily_returns = nav_df.pct_change().dropna()
+                    if not daily_returns.empty:
+                        drawdown = nav_df.div(nav_df.cummax()).sub(1)
+                        fig_dd = px.line(drawdown, x=drawdown.index, y=drawdown.columns, title="Drawdown through the backtest")
+                        fig_dd.update_yaxes(tickformat=".0%")
+                        st.plotly_chart(fig_dd, width="stretch")
+                        st.download_button("Download backtest NAV CSV", data=nav_df.to_csv().encode("utf-8"), file_name="investwise_backtest_nav.csv", mime="text/csv")
+
+
+        # ============================================================
 
 st.divider()
 st.caption("InvestWise is an academic decision-support prototype. Historical estimates are not guarantees or personalized financial advice. No broker orders are placed.")
